@@ -1,0 +1,105 @@
+name: installers
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install, restart, and stop
+        run: |
+          set -euo pipefail
+          export INSTALL_DIR="${RUNNER_TEMP}/autonomous-company"
+          export REPO_URL="${GITHUB_WORKSPACE}"
+          export NO_OPEN=1
+          secrets="${INSTALL_DIR}/.env"
+          bash install.sh
+          api="$(curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)"
+          web="$(curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/)"
+          test "$api" = "200"
+          test "$web" = "200"
+          hash1="$(shasum -a 256 "$secrets" | awk '{print $1}')"
+          bash install.sh
+          hash2="$(shasum -a 256 "$secrets" | awk '{print $1}')"
+          test "$hash1" = "$hash2"
+          api="$(curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs)"
+          web="$(curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/)"
+          test "$api" = "200"
+          test "$web" = "200"
+          bash "${INSTALL_DIR}/stop.sh"
+          closed=0
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            api_up=0
+            web_up=0
+            if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then api_up=1; fi
+            if lsof -nP -iTCP:3000 -sTCP:LISTEN >/dev/null 2>&1; then web_up=1; fi
+            if [[ "$api_up" = "0" && "$web_up" = "0" ]]; then
+              closed=1
+              break
+            fi
+            sleep 0.3
+          done
+          test "$closed" = "1"
+      - name: Show logs
+        if: failure()
+        run: |
+          dir="${RUNNER_TEMP}/autonomous-company"
+          for f in "$dir"/*.log; do
+            if [[ -f "$f" ]]; then
+              echo "----- $(basename "$f") -----"
+              tail -n 200 "$f" || true
+            fi
+          done
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install, restart, and stop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          $env:INSTALL_DIR = Join-Path $env:RUNNER_TEMP "autonomous-company"
+          $env:REPO_URL = $env:GITHUB_WORKSPACE
+          $env:NO_OPEN = "1"
+          $secrets = Join-Path $env:INSTALL_DIR ".env"
+          & (Join-Path $env:GITHUB_WORKSPACE "install.ps1")
+          $api = Invoke-WebRequest -Uri "http://127.0.0.1:8000/docs" -UseBasicParsing
+          $web = Invoke-WebRequest -Uri "http://127.0.0.1:3000/" -UseBasicParsing
+          if ([int]$api.StatusCode -ne 200) { throw "API expected HTTP 200" }
+          if ([int]$web.StatusCode -ne 200) { throw "web expected HTTP 200" }
+          $hash1 = (Get-FileHash -Algorithm SHA256 -LiteralPath $secrets).Hash
+          & (Join-Path $env:GITHUB_WORKSPACE "install.ps1")
+          $hash2 = (Get-FileHash -Algorithm SHA256 -LiteralPath $secrets).Hash
+          if ($hash1 -ne $hash2) { throw "secrets file changed" }
+          $api = Invoke-WebRequest -Uri "http://127.0.0.1:8000/docs" -UseBasicParsing
+          $web = Invoke-WebRequest -Uri "http://127.0.0.1:3000/" -UseBasicParsing
+          if ([int]$api.StatusCode -ne 200) { throw "API expected HTTP 200 after restart" }
+          if ([int]$web.StatusCode -ne 200) { throw "web expected HTTP 200 after restart" }
+          & (Join-Path $env:INSTALL_DIR "stop.ps1")
+          $closed = $false
+          foreach ($i in 1..20) {
+            $apiHit = netstat -ano | Select-String -Pattern ":8000\s" | Select-String -Pattern "LISTENING"
+            $webHit = netstat -ano | Select-String -Pattern ":3000\s" | Select-String -Pattern "LISTENING"
+            if (-not $apiHit -and -not $webHit) { $closed = $true; break }
+            Start-Sleep -Milliseconds 300
+          }
+          if (-not $closed) { throw "port 8000 or 3000 still listening" }
+      - name: Show logs
+        if: failure()
+        shell: powershell
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "autonomous-company"
+          Get-ChildItem -LiteralPath $dir -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host ("----- " + $_.Name + " -----")
+            Get-Content -LiteralPath $_.FullName -Tail 200
+          }

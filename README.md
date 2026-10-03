@@ -5,6 +5,22 @@ autonomous economic-agent platform. It defaults to a paper
 treasury, mock LLM, direct local queue, and autonomy level 0. Real-money mode
 is disabled in code and configuration.
 
+## Install
+
+macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lalalaoneplus-dev/autonomous-company/main/install.sh | bash
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/lalalaoneplus-dev/autonomous-company/main/install.ps1 | iex
+```
+
+Sets up the API, dashboard, and owner token, then opens http://127.0.0.1:3000.
+
 ## Local setup
 
 ```bash

@@ -2,6 +2,10 @@
 # Restarts only processes recorded in .run\*.pid. A port held by anything else stops the launch.
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+trap {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
 if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
   $PSNativeCommandUseErrorActionPreference = $false
 }
@@ -38,7 +42,9 @@ if (-not $env:PNPM_HOME) {
 $env:PATH = $env:PNPM_HOME + ";" + (Join-Path $env:PNPM_HOME "bin") + ";" + $env:PATH
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { Die "uv is required. Re-run install.ps1." }
-if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) { Die "pnpm is required. Re-run install.ps1." }
+$pnpm = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
+$corepack = Get-Command corepack.cmd -ErrorAction SilentlyContinue
+if (-not $pnpm -and -not $corepack) { Die "pnpm.cmd or corepack.cmd is required. Re-run install.ps1." }
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "Node.js is required. Re-run install.ps1." }
 $envFile = Join-Path $Root ".env"
 if (-not (Test-Path -LiteralPath $envFile)) { Die ("Missing " + $envFile + ". Re-run install.ps1.") }
@@ -48,7 +54,8 @@ if (-not (Test-Path -LiteralPath $py)) { Die "Python 3.12 virtualenv is missing.
 
 function Test-PortListen([string]$Port) {
   $pattern = ":" + $Port + "\s"
-  $lines = netstat -ano | Select-String -Pattern $pattern
+  $lines = & netstat -ano | Select-String -Pattern $pattern
+  if ($LASTEXITCODE -ne 0) { Die "netstat failed." }
   if (-not $lines) { return $false }
   foreach ($line in @($lines)) {
     if ($line -and ($line.Line -match "LISTENING")) { return $true }
@@ -56,9 +63,10 @@ function Test-PortListen([string]$Port) {
   return $false
 }
 
-function Wait-Http([string]$Url) {
+function Wait-Http([string]$Url, $Process) {
   $i = 0
   while ($i -lt 180) {
+    if ($Process.HasExited) { Die ("Server exited with code " + $Process.ExitCode + " while waiting for " + $Url) }
     try {
       $resp = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5
       if ([int]$resp.StatusCode -eq 200) { return }
@@ -72,6 +80,7 @@ function Wait-Http([string]$Url) {
 
 try {
   & (Join-Path $Root "stop.ps1")
+  if ($LASTEXITCODE -ne 0) { Die "Could not stop the previous processes." }
 } catch {
   Die $_.Exception.Message
 }
@@ -108,15 +117,22 @@ $nextJs = Join-Path $webDir "node_modules\next\dist\bin\next"
 if (-not (Test-Path -LiteralPath $nextJs)) {
   Die "next is required. Re-run install.ps1."
 }
-$node = (Get-Command node).Source
 $env:BROWSER = "none"
-$webProc = Start-Process -FilePath $node -ArgumentList @($nextJs, "dev", "-p", $WebPort) -WorkingDirectory $webDir -WindowStyle Hidden `
+if ($pnpm) {
+  $shim = $pnpm.Source
+  $verb = ""
+} else {
+  $shim = $corepack.Source
+  $verb = "pnpm "
+}
+$webCommand = '""' + $shim + '" ' + $verb + '--dir "' + $webDir + '" exec next dev -p ' + $WebPort + '"'
+$webProc = Start-Process -FilePath $env:ComSpec -ArgumentList @("/d", "/s", "/c", $webCommand) -WorkingDirectory $webDir -WindowStyle Hidden `
   -RedirectStandardOutput (Join-Path $Root "web.log") `
   -RedirectStandardError (Join-Path $Root "web.err.log") -PassThru
 Write-PidFile (Join-Path $runDir "web.pid") $webProc
 
-Wait-Http ($ApiUrl + "/docs")
-Wait-Http ($WebUrl + "/")
+Wait-Http ($ApiUrl + "/docs") $apiProc
+Wait-Http ($WebUrl + "/") $webProc
 
 if ($env:NO_OPEN -ne "1") {
   Start-Process $WebUrl | Out-Null
@@ -126,3 +142,4 @@ Write-Host ("Dashboard: " + $WebUrl)
 Write-Host ("API docs: " + $ApiUrl + "/docs")
 Write-Host ("Owner token file: " + $envFile)
 Write-Host ("Stop with: " + (Join-Path $Root "stop.ps1"))
+exit 0

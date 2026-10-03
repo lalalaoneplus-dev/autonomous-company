@@ -2,6 +2,10 @@
 # Windows PowerShell 5.1 and PowerShell 7. No administrator rights.
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+trap {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
 if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
   $PSNativeCommandUseErrorActionPreference = $false
 }
@@ -63,7 +67,7 @@ function Sync-Source([string]$Dest) {
       if ($LASTEXITCODE -ne 0) { Die ("git pull failed in " + $Dest) }
       return
     }
-    $children = @(Get-ChildItem -Force -LiteralPath $Dest -ErrorAction SilentlyContinue)
+    $children = @(Get-ChildItem -Force -LiteralPath $Dest)
     if ($children.Count -eq 0) {
       & git clone $url $Dest
       if ($LASTEXITCODE -ne 0) { Die ("git clone failed for " + $url) }
@@ -83,7 +87,7 @@ function Sync-Source([string]$Dest) {
     if ($inner.Count -lt 1) { Die "Downloaded archive was empty." }
     Copy-Tree $inner[0].FullName $Dest
   } finally {
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tmp -Recurse -Force
   }
 }
 
@@ -117,8 +121,10 @@ function Get-NodeArch {
 }
 
 function Get-NodeMajor {
-  $raw = & node -p "process.versions.node.split('.')[0]"
-  return [int]([string]$raw).Trim()
+  $raw = & node --version
+  if ($LASTEXITCODE -ne 0) { Die "Could not read the Node.js version." }
+  if (([string]$raw).Trim() -notmatch '^v([0-9]+)\.') { Die "Could not parse the Node.js version." }
+  return [int]$Matches[1]
 }
 
 function Ensure-Node([string]$Repo) {
@@ -152,7 +158,7 @@ function Ensure-Node([string]$Repo) {
     & robocopy $inner[0].FullName $bundled /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
     if ($LASTEXITCODE -ge 8) { Die "Could not unpack Node.js." }
   } finally {
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tmp -Recurse -Force
   }
   $env:PATH = $bundled + ";" + $env:PATH
   if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Die "Node.js is required." }
@@ -160,14 +166,21 @@ function Ensure-Node([string]$Repo) {
 }
 
 function Ensure-Pnpm {
-  if (Get-Command pnpm -ErrorAction SilentlyContinue) { return }
-  if (Get-Command corepack -ErrorAction SilentlyContinue) {
-    try {
-      & corepack enable
-      & corepack prepare pnpm@latest --activate
-    } catch {
-    }
-    if (Get-Command pnpm -ErrorAction SilentlyContinue) { return }
+  $pnpm = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
+  if ($pnpm) {
+    $script:PnpmCommand = $pnpm.Source
+    $script:PnpmViaCorepack = $false
+    return
+  }
+  $corepack = Get-Command corepack.cmd -ErrorAction SilentlyContinue
+  if ($corepack) {
+    & $corepack.Source prepare pnpm@latest --activate
+    if ($LASTEXITCODE -ne 0) { Die "corepack prepare failed." }
+    & $corepack.Source pnpm --version
+    if ($LASTEXITCODE -ne 0) { Die "corepack could not run pnpm." }
+    $script:PnpmCommand = $corepack.Source
+    $script:PnpmViaCorepack = $true
+    return
   }
   irm https://get.pnpm.io/install.ps1 | iex
   if (-not $env:LOCALAPPDATA) {
@@ -177,35 +190,41 @@ function Ensure-Pnpm {
   if ($env:PNPM_HOME) { $pnpmHome = $env:PNPM_HOME }
   $env:PNPM_HOME = $pnpmHome
   $env:PATH = $pnpmHome + ";" + (Join-Path $pnpmHome "bin") + ";" + $env:PATH
-  if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) { Die "pnpm is required." }
+  $pnpm = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
+  if (-not $pnpm) { Die "pnpm.cmd is required." }
+  $script:PnpmCommand = $pnpm.Source
+  $script:PnpmViaCorepack = $false
 }
 
-function Write-EnvIfMissing([string]$Repo, [string]$Python) {
+function Write-EnvIfMissing([string]$Repo) {
   $envFile = Join-Path $Repo ".env"
   if (Test-Path -LiteralPath $envFile) { return }
-  Copy-Item -LiteralPath (Join-Path $Repo ".env.example") -Destination $envFile
-  $token = (& $Python -c "import secrets; print(secrets.token_urlsafe(32))")
-  if ($LASTEXITCODE -ne 0) { Die "Could not generate the owner token." }
-  $token = ([string]$token).Trim()
-  $editor = @'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-token = sys.argv[2]
-lines = []
-found = False
-for line in path.read_text(encoding="utf-8").splitlines(True):
-    if line.startswith("OWNER_TOKEN="):
-        nl = "\n" if line.endswith("\n") else ""
-        lines.append("OWNER_TOKEN=" + token + nl)
-        found = True
-    else:
-        lines.append(line)
-if not found:
-    lines.append("OWNER_TOKEN=" + token + "\n")
-path.write_text("".join(lines), encoding="utf-8")
-'@
-  & $Python -c $editor $envFile $token
-  if ($LASTEXITCODE -ne 0) { Die "Could not write the owner token." }
+  $bytes = New-Object byte[] 32
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+  $token = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+  $utf8 = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList @($false, $true)
+  $source = [System.IO.File]::ReadAllBytes((Join-Path $Repo ".env.example"))
+  $offset = 0
+  if ($source.Length -ge 3 -and $source[0] -eq 239 -and $source[1] -eq 187 -and $source[2] -eq 191) {
+    $offset = 3
+  }
+  $content = $utf8.GetString($source, $offset, $source.Length - $offset)
+  $pattern = '(?m)^OWNER_TOKEN=[^\r\n]*'
+  if ([regex]::IsMatch($content, $pattern)) {
+    $content = [regex]::Replace($content, $pattern, 'OWNER_TOKEN=' + $token)
+  } else {
+    if ($content -match '\r\n') { $newline = "`r`n" } else { $newline = "`n" }
+    if ($content.Length -gt 0 -and -not $content.EndsWith("`n")) { $content += $newline }
+    $content += 'OWNER_TOKEN=' + $token + $newline
+  }
+  $tempFile = Join-Path $Repo (".env." + [guid]::NewGuid().ToString("n") + ".tmp")
+  try {
+    [System.IO.File]::WriteAllText($tempFile, $content, $utf8)
+    Move-Item -LiteralPath $tempFile -Destination $envFile
+  } finally {
+    if (Test-Path -LiteralPath $tempFile) { Remove-Item -LiteralPath $tempFile -Force }
+  }
 }
 
 $scriptPath = $PSCommandPath
@@ -237,7 +256,7 @@ if (-not (Test-Path -LiteralPath $py)) {
 }
 Ensure-Node $RepoDir
 Ensure-Pnpm
-Write-EnvIfMissing $RepoDir $py
+Write-EnvIfMissing $RepoDir
 
 & uv sync --python 3.12 --project $apiDir --extra test
 if ($LASTEXITCODE -ne 0) { Die "uv sync failed." }
@@ -251,7 +270,11 @@ try {
 $webDir = Join-Path (Join-Path $RepoDir "apps") "web"
 Push-Location $webDir
 try {
-  & pnpm install
+  if ($PnpmViaCorepack) {
+    & $PnpmCommand pnpm install
+  } else {
+    & $PnpmCommand install
+  }
   if ($LASTEXITCODE -ne 0) { Die "pnpm install failed." }
 } finally {
   Pop-Location
@@ -269,3 +292,4 @@ if ($env:NO_START -ne "1") {
   Write-Host ("Stop with: " + (Join-Path $RepoDir "stop.ps1"))
   Write-Host ("Owner token file: " + (Join-Path $RepoDir ".env"))
 }
+exit 0

@@ -73,12 +73,14 @@ jobs:
           $env:NO_OPEN = "1"
           $secrets = Join-Path $env:INSTALL_DIR ".env"
           & (Join-Path $env:GITHUB_WORKSPACE "install.ps1")
+          if ($LASTEXITCODE -ne 0) { throw "first install.ps1 run failed with exit code $LASTEXITCODE" }
           $api = Invoke-WebRequest -Uri "http://127.0.0.1:8000/docs" -UseBasicParsing
           $web = Invoke-WebRequest -Uri "http://127.0.0.1:3000/" -UseBasicParsing
           if ([int]$api.StatusCode -ne 200) { throw "API expected HTTP 200" }
           if ([int]$web.StatusCode -ne 200) { throw "web expected HTTP 200" }
           $hash1 = (Get-FileHash -Algorithm SHA256 -LiteralPath $secrets).Hash
           & (Join-Path $env:GITHUB_WORKSPACE "install.ps1")
+          if ($LASTEXITCODE -ne 0) { throw "second install.ps1 run failed with exit code $LASTEXITCODE" }
           $hash2 = (Get-FileHash -Algorithm SHA256 -LiteralPath $secrets).Hash
           if ($hash1 -ne $hash2) { throw "secrets file changed" }
           $api = Invoke-WebRequest -Uri "http://127.0.0.1:8000/docs" -UseBasicParsing
@@ -86,10 +88,13 @@ jobs:
           if ([int]$api.StatusCode -ne 200) { throw "API expected HTTP 200 after restart" }
           if ([int]$web.StatusCode -ne 200) { throw "web expected HTTP 200 after restart" }
           & (Join-Path $env:INSTALL_DIR "stop.ps1")
+          if ($LASTEXITCODE -ne 0) { throw "stop.ps1 failed with exit code $LASTEXITCODE" }
           $closed = $false
           foreach ($i in 1..20) {
-            $apiHit = netstat -ano | Select-String -Pattern ":8000\s" | Select-String -Pattern "LISTENING"
-            $webHit = netstat -ano | Select-String -Pattern ":3000\s" | Select-String -Pattern "LISTENING"
+            $listeners = & netstat -ano
+            if ($LASTEXITCODE -ne 0) { throw "netstat failed with exit code $LASTEXITCODE" }
+            $apiHit = $listeners | Select-String -Pattern ":8000\s" | Select-String -Pattern "LISTENING"
+            $webHit = $listeners | Select-String -Pattern ":3000\s" | Select-String -Pattern "LISTENING"
             if (-not $apiHit -and -not $webHit) { $closed = $true; break }
             Start-Sleep -Milliseconds 300
           }
